@@ -17,7 +17,7 @@ fi
 : "${MIGRATIONS_DIR:?Missing MIGRATIONS_DIR in .env}"
 : "${APPLIED_SUBDIR:?Missing APPLIED_SUBDIR in .env}"
 
-# Resolve paths relative to this script, if MIGRATIONS_DIR is relative
+# Resolve paths relative to this script if MIGRATIONS_DIR is relative
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "$MIGRATIONS_DIR" != /* ]]; then
   MIGRATIONS_DIR="$(cd "$SCRIPT_DIR/$MIGRATIONS_DIR" && pwd)"
@@ -29,11 +29,11 @@ mkdir -p "$APPLIED_DIR"
 command -v psql >/dev/null || { echo "❌ psql not found"; exit 1; }
 command -v flock >/dev/null || { echo "❌ flock not found (install util-linux)"; exit 1; }
 if command -v sha256sum >/dev/null; then
-  SHA256="sha256sum"
+  SHA256_CMD=(sha256sum)
 elif command -v shasum >/dev/null; then
-  SHA256="shasum -a 256"
+  SHA256_CMD=(shasum -a 256)
 else
-  echo "❌ no sha256 tool found (install coreutils)"; exit 1
+  echo "❌ No sha256 tool found (install coreutils)"; exit 1
 fi
 
 # ========= Lock to avoid concurrent runs =========
@@ -66,15 +66,30 @@ echo "🔹 Found ${#FILES[@]} migration(s) to apply."
 # ========= Apply in lexicographic order =========
 for FILE in "${FILES[@]}"; do
   BASE="$(basename "$FILE")"
-  SUM="$($SHA256 "$FILE" | awk '{print $1}')"
+
+  # Optional: guard against spaces in filenames
+  if [[ "$BASE" =~ [[:space:]] ]]; then
+    echo "❌ Migration filenames must not contain spaces: $BASE"; exit 1
+  fi
+
+  # Compute SHA-256 of the file
+  SUM="$("${SHA256_CMD[@]}" "$FILE" | awk '{print $1}')"
 
   echo "— Applying: $BASE"
 
-  # Skip if same filename+hash recorded (safety)
-  if psql "$PROD_DB_URL" -At -v ON_ERROR_STOP=1 \
-       -v fname="$BASE" -v sha="$SUM" \
-       -c "SELECT 1 FROM migration_history WHERE filename = :'fname' AND sha256 = :'sha' LIMIT 1" \
-       | grep -q '^1$'; then
+  # Check if already applied (same filename + hash). Set vars inside psql.
+  ALREADY_APPLIED=$(
+    psql "$PROD_DB_URL" -At -v ON_ERROR_STOP=1 <<PSQL
+\\set fname '$BASE'
+\\set sha   '$SUM'
+SELECT 1
+FROM migration_history
+WHERE filename = :'fname' AND sha256 = :'sha'
+LIMIT 1;
+PSQL
+  )
+
+  if [[ "$ALREADY_APPLIED" == "1" ]]; then
     echo "   ↳ Already applied (same hash). Archiving."
     mv -f "$FILE" "$APPLIED_DIR/$BASE"
     continue
@@ -83,9 +98,13 @@ for FILE in "${FILES[@]}"; do
   # Apply as-is; file controls its own transaction scope
   psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f "$FILE"
 
-  # Record and archive
-  psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -v fname="$BASE" -v sha="$SUM" \
-    -c "INSERT INTO migration_history (filename, sha256) VALUES (:'fname', :'sha');"
+  # Record in history and archive (set vars inside psql)
+  psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 <<PSQL
+\\set fname '$BASE'
+\\set sha   '$SUM'
+INSERT INTO migration_history (filename, sha256)
+VALUES (:'fname', :'sha');
+PSQL
 
   mv -f "$FILE" "$APPLIED_DIR/$BASE"
   echo "   ✅ Applied and archived → ${APPLIED_DIR}/${BASE}"
