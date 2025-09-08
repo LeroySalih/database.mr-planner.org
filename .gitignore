@@ -3,3 +3,4 @@
 # dependencies
 /node_modules
 /db_data/
+/scripts/backups

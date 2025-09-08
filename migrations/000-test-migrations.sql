@@ -1,0 +1,1 @@
+UPDATE profiles  set "order_by"=0 where user_id='user_2yjidP4UdYKaAmizJ9TzJvecPhw';
